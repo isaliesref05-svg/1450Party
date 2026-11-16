@@ -125,6 +125,7 @@ class OnlineManager {
 
   private regPeer: Peer | null = null;
   private regPending = false;
+  private regAttempted = false;
   private regRooms = new Map<string, DiscoveredRoom>();
   private annConn: DataConnection | null = null;
   private annTimer: ReturnType<typeof setInterval> | null = null;
@@ -194,8 +195,9 @@ class OnlineManager {
 
   claimRegistry() {
     if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-    if (this.regPeer || this.regPending) return;
+    if (this.regPeer || this.regPending || this.regAttempted) return;
     this.regPending = true;
+    this.regAttempted = true;
     try {
       const p = new Peer(REG_ID, PEER_CONFIG);
       p.on('open', () => {
@@ -435,10 +437,13 @@ class OnlineManager {
         if (err.type === 'peer-unavailable') return;
         if (this.createTimer) { clearTimeout(this.createTimer); this.createTimer = null; }
         this.creating = false;
-        this.handlers?.onToast(
-          err.type === 'unavailable-id' ? 'Bu otaq adı artıq istifadədədir' : `Bağlantı xətası: ${err.type}`,
-          'error'
-        );
+        let msg = `Bağlantı xətası: ${err.type}`;
+        if (err.type === 'unavailable-id') {
+          msg = 'Bu otaq adı artıq istifadədədir, başqa ad yazın';
+        } else if (err.type === 'network') {
+          msg = 'Serverlə əlaqə qurulmadı. Zəhmət olmasa bir neçə saniyə sonra təkrar cəhd edin.';
+        }
+        this.handlers?.onToast(msg, 'error');
         this.cleanup();
       });
 
@@ -602,10 +607,13 @@ class OnlineManager {
 
         this.joining = false;
         this.reconnecting = false;
-        this.handlers?.onToast(
-          err.type === 'peer-unavailable' ? 'Otaq tapılmadı' : `Bağlantı xətası: ${err.type}`,
-          'error'
-        );
+        let msg = `Bağlantı xətası: ${err.type}`;
+        if (err.type === 'peer-unavailable') {
+          msg = 'Otaq tapılmadı — otaq adını dəqiq yazdığınızdan əmin olun';
+        } else if (err.type === 'network') {
+          msg = 'Serverlə əlaqə qurulmadı. Zəhmət olmasa bir neçə saniyə sonra təkrar cəhd edin.';
+        }
+        this.handlers?.onToast(msg, 'error');
         this.cleanup();
       });
 
