@@ -65,7 +65,7 @@ export function OnlineScreens({ screen, onNavigate, onBackHome }: OnlineScreensP
   useEffect(() => {
     if (screen !== 'roomJoin') return;
     onlineManager.refreshRooms();
-    const id = setInterval(() => onlineManager.refreshRooms(), 5000);
+    const id = setInterval(() => onlineManager.refreshRooms(), 15000);
     return () => clearInterval(id);
   }, [screen]);
 
