@@ -7,6 +7,50 @@ import { inputPlayers, MapId, MinigameId, PLAYER_NAMES, WeaponChoice } from './t
 
 export const MAX_ONLINE_SLOTS = 4;
 const REG_ID = 'stickparty-registry-v1x';
+const JOIN_TIMEOUT_MS = 8000;
+const CREATE_TIMEOUT_MS = 10000;
+const RECONNECT_DELAY_MS = 1500;
+const MAX_RECONNECT_ATTEMPTS = 3;
+const STALE_ROOM_TTL_MS = 16000;
+const ANNOUNCE_INTERVAL_MS = 4000;
+
+export const PEER_CONFIG: import('peerjs').PeerJSOption = {
+  config: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:global.stun.twilio.com:3478' },
+    ],
+    iceCandidatePoolSize: 10,
+  },
+};
+
+export function normalizeRoomName(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/ə/g, 'e')
+    .replace(/ı/g, 'i')
+    .replace(/ş/g, 's')
+    .replace(/ç/g, 'c')
+    .replace(/ü/g, 'u')
+    .replace(/ğ/g, 'g')
+    .replace(/ö/g, 'o');
+}
+
+export function roomPeerId(name: string): string {
+  return (
+    'stickparty-' +
+    [...normalizeRoomName(name)]
+      .map((c) => (/[a-z0-9]/.test(c) ? c : '_' + c.charCodeAt(0).toString(16)))
+      .join('') +
+    'x'
+  );
+}
 
 export interface LobbyConfig {
   mode: 'vs' | 'minigames';
@@ -52,16 +96,6 @@ export interface OnlineHandlers {
 
 type TaggedConn = DataConnection & { slot?: number };
 
-export function roomPeerId(name: string): string {
-  return (
-    'stickparty-' +
-    [...name.trim().toLowerCase()]
-      .map((c) => (/[a-z0-9]/.test(c) ? c : '_' + c.charCodeAt(0).toString(16)))
-      .join('') +
-    'x'
-  );
-}
-
 class OnlineManager {
   private peer: Peer | null = null;
   private conn: DataConnection | null = null;
@@ -83,6 +117,11 @@ class OnlineManager {
     mini: 'sumo',
   };
   private netFrame = 0;
+  private joinTimer: ReturnType<typeof setTimeout> | null = null;
+  private createTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
+  private reconnecting = false;
+  private savedJoinPassword = '';
 
   private regPeer: Peer | null = null;
   private regPending = false;
@@ -158,7 +197,7 @@ class OnlineManager {
     if (this.regPeer || this.regPending) return;
     this.regPending = true;
     try {
-      const p = new Peer(REG_ID);
+      const p = new Peer(REG_ID, PEER_CONFIG);
       p.on('open', () => {
         this.regPending = false;
         this.regPeer = p;
@@ -199,7 +238,7 @@ class OnlineManager {
           } else if (d.type === 'list') {
             const now = Date.now();
             for (const [k, v] of this.regRooms) {
-              if (now - v.t > 12000) this.regRooms.delete(k);
+              if (now - v.t > STALE_ROOM_TTL_MS) this.regRooms.delete(k);
             }
             try {
               c.send({ type: 'rooms', rooms: [...this.regRooms.values()] });
@@ -235,7 +274,7 @@ class OnlineManager {
     };
     const timeout = setTimeout(() => finish(null), 5000);
     try {
-      lp = new Peer();
+      lp = new Peer(PEER_CONFIG);
       lp.on('error', () => finish(null));
       lp.on('open', () => {
         if (!lp) return;
@@ -285,7 +324,7 @@ class OnlineManager {
       }
     };
     send();
-    this.annTimer = setInterval(send, 4000);
+    this.annTimer = setInterval(send, ANNOUNCE_INTERVAL_MS);
   }
 
   private announceStop() {
@@ -310,6 +349,8 @@ class OnlineManager {
 
   cleanup() {
     this.announceStop();
+    if (this.joinTimer) { clearTimeout(this.joinTimer); this.joinTimer = null; }
+    if (this.createTimer) { clearTimeout(this.createTimer); this.createTimer = null; }
     const cs = this.conns.slice();
     const c = this.conn;
     const p = this.peer;
@@ -322,8 +363,11 @@ class OnlineManager {
     this.guestReadyFlag = false;
     this.creating = false;
     this.joining = false;
+    this.reconnecting = false;
+    this.reconnectAttempts = 0;
     this.roomName = '';
     this.roomPassword = '';
+    this.savedJoinPassword = '';
     this.lobbySlots = [null, null, null, null];
     this.lobbyReady = [true, false, false, false];
     PLAYER_NAMES[0] = PartyEconomy.name() || 'P1';
@@ -364,11 +408,20 @@ class OnlineManager {
     this.roomPassword = password;
     this.emit();
 
+    // Timeout: əgər peer açılmazsa cleanup et
+    this.createTimer = setTimeout(() => {
+      if (this.creating) {
+        this.handlers?.onToast('Serverə qoşulmaq çox uzun çəkdi — yenidən cəhd edin', 'error');
+        this.cleanup();
+      }
+    }, CREATE_TIMEOUT_MS);
+
     try {
-      const p = new Peer(roomPeerId(cleanName));
+      const p = new Peer(roomPeerId(cleanName), PEER_CONFIG);
       this.peer = p;
 
       p.on('open', () => {
+        if (this.createTimer) { clearTimeout(this.createTimer); this.createTimer = null; }
         this.creating = false;
         this.lobbySlots = [PartyEconomy.name() || 'Host', null, null, null];
         this.lobbyReady = [true, false, false, false];
@@ -380,6 +433,7 @@ class OnlineManager {
 
       p.on('error', (err) => {
         if (err.type === 'peer-unavailable') return;
+        if (this.createTimer) { clearTimeout(this.createTimer); this.createTimer = null; }
         this.creating = false;
         this.handlers?.onToast(
           err.type === 'unavailable-id' ? 'Bu otaq adı artıq istifadədədir' : `Bağlantı xətası: ${err.type}`,
@@ -388,80 +442,101 @@ class OnlineManager {
         this.cleanup();
       });
 
+      p.on('disconnected', () => {
+        // PeerJS signaling disconnected — reconnect cəhdi
+        try { p.reconnect(); } catch { /* ignore */ }
+      });
+
       p.on('connection', (rawConn) => {
         const c = rawConn as TaggedConn;
-        c.on('data', (raw) => {
-          const d = raw as Record<string, unknown>;
-          if (!d || typeof d !== 'object') return;
-          if (d.type === 'auth') {
-            if (this.conns.filter((x) => x.open).length >= MAX_ONLINE_SLOTS - 1) {
-              c.send({ type: 'full' });
-              setTimeout(() => c.close(), 200);
-              return;
-            }
-            if ((d.password || '') !== this.roomPassword) {
-              c.send({ type: 'authFail' });
-              setTimeout(() => c.close(), 200);
-              return;
-            }
-            let freeSlot = -1;
-            for (let s = 1; s < MAX_ONLINE_SLOTS; s++) {
-              if (!this.lobbySlots[s]) {
-                freeSlot = s;
-                break;
+
+        const setupConn = () => {
+          c.on('data', (raw) => {
+            const d = raw as Record<string, unknown>;
+            if (!d || typeof d !== 'object') return;
+            if (d.type === 'auth') {
+              if (this.conns.filter((x) => x.open).length >= MAX_ONLINE_SLOTS - 1) {
+                c.send({ type: 'full' });
+                setTimeout(() => c.close(), 200);
+                return;
               }
+              if ((d.password || '') !== this.roomPassword) {
+                c.send({ type: 'authFail' });
+                setTimeout(() => c.close(), 200);
+                return;
+              }
+              let freeSlot = -1;
+              for (let s = 1; s < MAX_ONLINE_SLOTS; s++) {
+                if (!this.lobbySlots[s]) {
+                  freeSlot = s;
+                  break;
+                }
+              }
+              if (freeSlot < 0) freeSlot = this.conns.length + 1;
+              const gName = String(d.name || '').trim().slice(0, 14) || `P${freeSlot + 1}`;
+              const normIncoming = gName.toLowerCase();
+              const hasDup = this.lobbySlots.some(
+                (existing) => existing !== null && existing.trim().toLowerCase() === normIncoming
+              );
+              if (hasDup) {
+                c.send({ type: 'dupName' });
+                setTimeout(() => c.close(), 200);
+                return;
+              }
+              c.slot = freeSlot;
+              this.conns.push(c);
+              this.lobbySlots[freeSlot] = gName;
+              this.lobbyReady[freeSlot] = false;
+              PLAYER_NAMES[freeSlot] = gName;
+              c.send({
+                type: 'authOk',
+                slot: freeSlot,
+                name: PartyEconomy.name() || 'Host',
+                slots: this.lobbySlots,
+                ready: this.lobbyReady,
+                cfg: this.cfg,
+              });
+              this.broadcastLobby();
+              this.announceStart();
+            } else if (c.slot) {
+              this.handleNetData(d, c.slot);
             }
-            if (freeSlot < 0) freeSlot = this.conns.length + 1;
-            const gName = String(d.name || '').trim().slice(0, 14) || `P${freeSlot + 1}`;
-            const normIncoming = gName.toLowerCase();
-            const hasDup = this.lobbySlots.some(
-              (existing) => existing !== null && existing.trim().toLowerCase() === normIncoming
-            );
-            if (hasDup) {
-              c.send({ type: 'dupName' });
-              setTimeout(() => c.close(), 200);
-              return;
+          });
+
+          c.on('close', () => {
+            const idx = this.conns.indexOf(c);
+            if (idx < 0) return;
+            this.conns.splice(idx, 1);
+            const slot = c.slot;
+            if (slot && slot >= 1 && slot < MAX_ONLINE_SLOTS) {
+              this.lobbySlots[slot] = null;
+              this.lobbyReady[slot] = false;
+              PLAYER_NAMES[slot] = `P${slot + 1}`;
             }
-            c.slot = freeSlot;
-            this.conns.push(c);
-            this.lobbySlots[freeSlot] = gName;
-            this.lobbyReady[freeSlot] = false;
-            PLAYER_NAMES[freeSlot] = gName;
-            c.send({
-              type: 'authOk',
-              slot: freeSlot,
-              name: PartyEconomy.name() || 'Host',
-              slots: this.lobbySlots,
-              ready: this.lobbyReady,
-              cfg: this.cfg,
-            });
             this.broadcastLobby();
             this.announceStart();
-          } else if (c.slot) {
-            this.handleNetData(d, c.slot);
-          }
-        });
+            if (this.isGameActive() && this.conns.length === 0) {
+              this.handlers?.onToast('Rəqib oyundan ayrıldı', 'error');
+              this.cleanup();
+              this.handlers?.onDisconnectToHome();
+            }
+          });
 
-        c.on('close', () => {
-          const idx = this.conns.indexOf(c);
-          if (idx < 0) return;
-          this.conns.splice(idx, 1);
-          const slot = c.slot;
-          if (slot && slot >= 1 && slot < MAX_ONLINE_SLOTS) {
-            this.lobbySlots[slot] = null;
-            this.lobbyReady[slot] = false;
-            PLAYER_NAMES[slot] = `P${slot + 1}`;
-          }
-          this.broadcastLobby();
-          this.announceStart();
-          if (this.isGameActive() && this.conns.length === 0) {
-            this.handlers?.onToast('Rəqib oyundan ayrıldı', 'error');
-            this.cleanup();
-            this.handlers?.onDisconnectToHome();
-          }
-        });
+          c.on('error', () => {
+            // Connection error — close will fire
+          });
+        };
+
+        // Əgər connection artıq açıqdırsa, dərhal setup et
+        // Əks halda 'open' event-ini gözlə
+        if (c.open) {
+          setupConn();
+        } else {
+          c.on('open', setupConn);
+        }
       });
     } catch {
+      if (this.createTimer) { clearTimeout(this.createTimer); this.createTimer = null; }
       this.creating = false;
       this.cleanup();
       this.handlers?.onToast('Onlayn serverə qoşulmaq mümkün olmadı', 'error');
@@ -479,14 +554,54 @@ class OnlineManager {
     this.isHostFlag = false;
     this.joining = true;
     this.roomName = cleanName;
+    this.savedJoinPassword = password;
+    this.reconnectAttempts = 0;
+    this.reconnecting = false;
     this.emit();
 
+    this.attemptJoin(cleanName, password);
+  }
+
+  private attemptJoin(cleanName: string, password: string) {
+    // Join timeout — əgər cavab gəlməsə xəta göstər
+    if (this.joinTimer) { clearTimeout(this.joinTimer); this.joinTimer = null; }
+    this.joinTimer = setTimeout(() => {
+      if (this.joining) {
+        this.joining = false;
+        this.handlers?.onToast(
+          this.reconnecting
+            ? 'Yenidən qoşulmaq mümkün olmadı'
+            : 'Otağa qoşulmaq çox uzun çəkdi — otaq mövcud olmaya bilər',
+          'error'
+        );
+        this.cleanup();
+      }
+    }, JOIN_TIMEOUT_MS);
+
     try {
-      const p = new Peer();
+      const p = new Peer(PEER_CONFIG);
       this.peer = p;
 
       p.on('error', (err) => {
+        if (this.joinTimer) { clearTimeout(this.joinTimer); this.joinTimer = null; }
+
+        // Peer-unavailable: otaq tapılmadı — reconnect cəhd et
+        if (err.type === 'peer-unavailable' && !this.reconnecting && this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          this.reconnectAttempts++;
+          this.reconnecting = true;
+          this.handlers?.onToast(`Otaq tapılmadı, yenidən cəhd edilir (${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, 'info');
+          setTimeout(() => {
+            if (this.onlineFlag && this.joining) {
+              try { p.destroy(); } catch { /* ignore */ }
+              this.peer = null;
+              this.attemptJoin(cleanName, password);
+            }
+          }, RECONNECT_DELAY_MS);
+          return;
+        }
+
         this.joining = false;
+        this.reconnecting = false;
         this.handlers?.onToast(
           err.type === 'peer-unavailable' ? 'Otaq tapılmadı' : `Bağlantı xətası: ${err.type}`,
           'error'
@@ -497,23 +612,62 @@ class OnlineManager {
       p.on('open', () => {
         const c = p.connect(roomPeerId(cleanName), { reliable: true });
         this.conn = c;
+
         c.on('open', () => {
           c.send({ type: 'auth', password, name: PartyEconomy.name() || '' });
         });
+
         c.on('data', (raw) => {
           const d = raw as Record<string, unknown>;
-          if (d && typeof d === 'object') this.handleNetData(d, 0);
-        });
-        c.on('close', () => {
-          if (this.onlineFlag) {
-            this.handlers?.onToast('Host ilə bağlantı kəsildi', 'error');
-            this.cleanup();
-            if (this.isGameActive()) this.handlers?.onDisconnectToHome();
+          if (d && typeof d === 'object') {
+            // Auth cavabı gəldi — join timeout-u sil
+            if (d.type === 'authOk' || d.type === 'authFail' || d.type === 'full' || d.type === 'dupName') {
+              if (this.joinTimer) { clearTimeout(this.joinTimer); this.joinTimer = null; }
+              this.reconnecting = false;
+              this.reconnectAttempts = 0;
+            }
+            this.handleNetData(d, 0);
           }
         });
+
+        c.on('close', () => {
+          if (!this.onlineFlag) return;
+
+          // Oyun zamanı qoşulma kəsilsə — avtomatik reconnect cəhdi
+          if (this.isGameActive() && this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+            this.reconnectAttempts++;
+            this.handlers?.onToast(`Host ilə bağlantı kəsildi, yenidən qoşulur (${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, 'info');
+            this.joining = true;
+            this.emit();
+            setTimeout(() => {
+              if (this.onlineFlag) {
+                try { p.destroy(); } catch { /* ignore */ }
+                this.peer = null;
+                this.conn = null;
+                this.attemptJoin(cleanName, this.savedJoinPassword);
+              }
+            }, RECONNECT_DELAY_MS);
+            return;
+          }
+
+          this.handlers?.onToast('Host ilə bağlantı kəsildi', 'error');
+          this.cleanup();
+          if (this.isGameActive()) this.handlers?.onDisconnectToHome();
+        });
+
+        c.on('error', () => {
+          // Connection-level error — close event handle edəcək
+        });
+      });
+
+      p.on('disconnected', () => {
+        // Signaling server ilə əlaqə qırıldı — reconnect cəhdi
+        try { p.reconnect(); } catch { /* ignore */ }
       });
     } catch {
+      if (this.joinTimer) { clearTimeout(this.joinTimer); this.joinTimer = null; }
       this.joining = false;
+      this.reconnecting = false;
       this.cleanup();
       this.handlers?.onToast('Qoşulma xətası', 'error');
     }
@@ -592,7 +746,7 @@ class OnlineManager {
     }
     const live = this.conns.filter((c) => c.open);
     if (!live.length) return;
-    if (++this.netFrame % 2) return;
+    this.netFrame++;
     const msg =
       mode === 'vs'
         ? { type: 'fstate', s: serializeFight() }
