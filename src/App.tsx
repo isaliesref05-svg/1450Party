@@ -108,11 +108,8 @@ export default function App() {
     const unsub = PartyEconomy.subscribe(() => setEcoTick((t) => t + 1));
     PartyAudio.init();
     bindKeyboardListeners();
-    onlineManager.claimRegistry();
-    const regInterval = setInterval(() => onlineManager.claimRegistry(), 10000);
     return () => {
       unsub();
-      clearInterval(regInterval);
     };
   }, []);
 
