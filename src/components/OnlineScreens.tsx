@@ -290,9 +290,9 @@ export function OnlineScreens({ screen, onNavigate, onBackHome }: OnlineScreensP
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            if (!directName.trim()) return;
-            setJoinPass('');
-            setJoinTarget({ name: directName.trim(), lock: false });
+            const clean = directName.trim();
+            if (!clean) return;
+            onlineManager.joinRoom(clean, '');
           }}
           className="shrink-0 p-2.5 sm:px-5 bg-[#0d0e11] border-b border-zinc-800 flex items-center gap-2"
         >
@@ -306,9 +306,10 @@ export function OnlineScreens({ screen, onNavigate, onBackHome }: OnlineScreensP
           />
           <button
             type="submit"
-            className="h-9 sm:h-10 px-4 rounded-lg bg-white text-zinc-950 text-xs font-bold shrink-0"
+            disabled={snap.joining}
+            className="h-9 sm:h-10 px-4 rounded-lg bg-white disabled:opacity-50 text-zinc-950 text-xs font-bold shrink-0 transition"
           >
-            Qoşul
+            {snap.joining ? 'Qoşulur...' : 'Qoşul'}
           </button>
         </form>
 
